@@ -92,3 +92,8 @@ required-features = ["bench-internals"]
 name = "l2_score_and_rank"
 harness = false
 required-features = ["bench-internals"]
+
+[[bench]]
+name = "centroid_cache_concurrent_read"
+harness = false
+required-features = ["bench-internals"]

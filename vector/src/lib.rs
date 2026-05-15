@@ -51,6 +51,13 @@ pub(crate) mod test_utils;
 pub(crate) mod utils;
 pub(crate) mod write;
 
+/// Public helpers for the `bench-internals` cargo feature. Surfaces a
+/// minimal API so criterion benches in `vector/benches/` can exercise
+/// crate-private internals without widening their `pub(crate)`
+/// visibility. Compiled out by default.
+#[cfg(feature = "bench-internals")]
+pub mod bench_helpers;
+
 // Public API exports
 pub use admin::VectorDbAdmin;
 pub use db::{VectorDb, VectorDbRead};

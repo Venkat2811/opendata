@@ -57,7 +57,7 @@ use rayon::prelude::IntoParallelIterator;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tracing::debug;
 
@@ -764,8 +764,13 @@ struct WrittenPostingList {
 
 /// A cache that holds all posting lists for non-leaf centroids (level > 1) in-memory. Used when
 /// running VectorDb (the reader-writer process).
+///
+/// Concurrency: backed by an `RwLock` so concurrent queries take read
+/// locks without serializing on each other. The flusher takes the
+/// write lock exclusively (rare, once per flush batch) to install new
+/// posting lists.
 pub(crate) struct AllCentroidsCache {
-    inner: Arc<Mutex<AllCentroidsCacheInner>>,
+    inner: Arc<RwLock<AllCentroidsCacheInner>>,
 }
 
 impl CentroidCache for AllCentroidsCache {
@@ -775,7 +780,7 @@ impl CentroidCache for AllCentroidsCache {
 
     fn postings(&self, centroid_ids: &[VectorId], epoch: u64) -> Vec<Arc<PostingList>> {
         self.inner
-            .lock()
+            .read()
             .expect("lock poisoned")
             .postings(centroid_ids)
             .into_iter()
@@ -792,7 +797,7 @@ impl CentroidCache for AllCentroidsCache {
 
 #[derive(Debug)]
 pub(crate) struct AllCentroidsCacheWriter {
-    inner: Arc<Mutex<AllCentroidsCacheInner>>,
+    inner: Arc<RwLock<AllCentroidsCacheInner>>,
 }
 
 impl AllCentroidsCacheWriter {
@@ -821,7 +826,7 @@ impl AllCentroidsCacheWriter {
                 },
             )])
             .collect();
-        let inner = Arc::new(Mutex::new(AllCentroidsCacheInner::new(postings)));
+        let inner = Arc::new(RwLock::new(AllCentroidsCacheInner::new(postings)));
         Self { inner }
     }
 
@@ -852,7 +857,7 @@ impl AllCentroidsCacheWriter {
             Arc::new(pl)
         }
 
-        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut inner = self.inner.write().expect("lock poisoned");
 
         if root.is_some() || !root_updates.is_empty() {
             let root = if let Some(root) = root {
@@ -1262,7 +1267,7 @@ mod tests {
         distance_metric: DistanceMetric,
     ) -> LeveledCentroidIndex<'static> {
         let cache: Arc<dyn CentroidCache> = Arc::new(AllCentroidsCache {
-            inner: Arc::new(Mutex::new(AllCentroidsCacheInner::new(
+            inner: Arc::new(RwLock::new(AllCentroidsCacheInner::new(
                 postings
                     .into_iter()
                     .chain(vec![(ROOT_VECTOR_ID, root)])
@@ -1871,6 +1876,130 @@ mod tests {
                 .posting(vector_id(2, 100), 5)
                 .expect("centroid should be cached"),
             vec![(1, 2, vec![2.0, 0.0]), (1, 3, vec![3.0, 0.0])],
+        );
+    }
+
+    /// Concurrent readers must not serialize on the cache lock. With
+    /// the previous `Mutex`, every `posting()` call acquired the same
+    /// exclusive lock; with `RwLock`, multiple read locks coexist.
+    ///
+    /// This test does not bench QPS (single-run timings are noisy in
+    /// `cargo test`) — it asserts that 16 reader threads all complete
+    /// every lookup successfully against a populated cache. Surfaces
+    /// deadlocks, lock poisoning, or torn reads.
+    #[test]
+    fn should_serve_concurrent_readers_against_centroid_cache() {
+        // given
+        let mut postings = Vec::new();
+        for i in 0..32u64 {
+            postings.push((
+                vector_id(2, 100 + i),
+                // Inner posting id must be >= 1 (0 is reserved for ROOT).
+                posting_list(vec![(1, i + 1, vec![i as f32, 0.0])]),
+            ));
+        }
+        let writer = AllCentroidsCacheWriter::new(posting_list(vec![]), postings);
+        let cache = Arc::new(writer.cache());
+
+        // when
+        let mut handles = Vec::new();
+        for worker in 0..16u64 {
+            let cache = Arc::clone(&cache);
+            handles.push(std::thread::spawn(move || {
+                for q in 0..50u64 {
+                    let centroid_id = vector_id(2, 100 + ((worker * 50 + q) % 32));
+                    let p = cache
+                        .posting(centroid_id, u64::MAX)
+                        .expect("centroid posting should be cached");
+                    // Force-touch the posting list so the read isn't
+                    // optimized away.
+                    assert!(!p.is_empty());
+                }
+            }));
+        }
+
+        // then
+        for h in handles {
+            h.join().expect("reader task should not panic");
+        }
+    }
+
+    /// Readers must not block (or be blocked by) a concurrent writer
+    /// long-term. The writer takes the write lock briefly per
+    /// `update_postings` call; readers should see either the
+    /// pre-update or post-update view, never observe a torn intermediate.
+    #[test]
+    fn should_not_block_readers_during_concurrent_cache_writes() {
+        // given
+        let mut postings = Vec::new();
+        for i in 0..8u64 {
+            postings.push((
+                vector_id(2, 100 + i),
+                // Inner posting id must be >= 1 (0 is reserved for ROOT).
+                posting_list(vec![(1, i + 1, vec![i as f32, 0.0])]),
+            ));
+        }
+        let writer = AllCentroidsCacheWriter::new(posting_list(vec![]), postings);
+        let writer = Arc::new(writer);
+        let cache = Arc::new(writer.cache());
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let cache = Arc::clone(&cache);
+            let stop = Arc::clone(&stop);
+            readers.push(std::thread::spawn(move || {
+                let mut count = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for i in 0..8u64 {
+                        let p = cache
+                            .posting(vector_id(2, 100 + i), u64::MAX)
+                            .expect("centroid posting should always be cached");
+                        assert!(!p.is_empty());
+                        count += 1;
+                    }
+                }
+                count
+            }));
+        }
+
+        // Let reader threads actually start before issuing writes.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // when — apply several update_postings batches interleaved
+        // with reads. Sleep briefly between batches so reads have
+        // time to interleave with the writes.
+        for batch in 1..=4u64 {
+            let writer = Arc::clone(&writer);
+            let new_centroid_id = vector_id(2, 200 + batch);
+            let mut new_centroids = HashSet::new();
+            new_centroids.insert(new_centroid_id);
+            writer.update_postings(
+                batch,
+                None,
+                vec![],
+                &new_centroids,
+                vec![(
+                    new_centroid_id,
+                    vec![PostingUpdate::append(
+                        vector_id(1, batch),
+                        vec![batch as f32, 0.0],
+                    )],
+                )],
+                &empty_deleted_centroids(),
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // then
+        let mut total = 0u64;
+        for h in readers {
+            total += h.join().expect("reader task should not panic");
+        }
+        assert!(
+            total > 0,
+            "readers should complete at least one lookup during the write window",
         );
     }
 }
